@@ -16,6 +16,8 @@ MODULE_DESCRIPTION("virtual cfg80211 driver");
 #define SSID_DUMMY "MyHomeWiFi"
 #define SSID_DUMMY_SIZE (sizeof(SSID_DUMMY) - 1)
 
+static u8 fake_router_bssid[ETH_ALEN] __ro_after_init = {};
+
 struct owl_context {
     struct wiphy *wiphy;
     struct net_device *ndev;
@@ -69,7 +71,6 @@ static void inform_dummy_bss(struct owl_context *owl)
         .scan_width = NL80211_BSS_CHAN_WIDTH_20,
         .signal = 1337,
     };
-    char bssid[6] = {0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff};
 
     /* array of tags that retrieved from beacon frame or probe responce */
     char ie[SSID_DUMMY_SIZE + 2] = {WLAN_EID_SSID, SSID_DUMMY_SIZE};
@@ -77,7 +78,7 @@ static void inform_dummy_bss(struct owl_context *owl)
 
     /* It is posible to use cfg80211_inform_bss() instead. */
     bss = cfg80211_inform_bss_data(
-        owl->wiphy, &data, CFG80211_BSS_FTYPE_UNKNOWN, bssid, 0,
+        owl->wiphy, &data, CFG80211_BSS_FTYPE_UNKNOWN, fake_router_bssid, 0,
         WLAN_CAPABILITY_ESS, 100, ie, sizeof(ie), GFP_KERNEL);
 
     /* cfg80211_inform_bss_data() returns cfg80211_bss structure referefence
@@ -109,7 +110,6 @@ static void owl_scan_routine(struct work_struct *w)
      * called before cfg80211_ops->scan() returns?
      */
     msleep(100);
-
     /* inform with dummy BSS */
     inform_dummy_bss(owl);
 
@@ -134,10 +134,8 @@ static void owl_scan_routine(struct work_struct *w)
 static void owl_connect_routine(struct work_struct *w)
 {
     struct owl_context *owl = container_of(w, struct owl_context, ws_connect);
-
     if (mutex_lock_interruptible(&owl->lock))
         return;
-
     if (memcmp(owl->connecting_ssid, SSID_DUMMY, sizeof(SSID_DUMMY)) != 0) {
         cfg80211_connect_timeout(owl->ndev, NULL, NULL, 0, GFP_KERNEL,
                                  NL80211_TIMEOUT_SCAN);
@@ -295,8 +293,18 @@ static struct net_device_ops owl_ndev_ops = {
 static struct ieee80211_channel owl_supported_channels_2ghz[] = {
     {
         .band = NL80211_BAND_2GHZ,
+        .hw_value = 11,
+        .center_freq = 2412,
+    },
+    {
+        .band = NL80211_BAND_2GHZ,
         .hw_value = 6,
         .center_freq = 2437,
+    },
+    {
+        .band = NL80211_BAND_2GHZ,
+        .hw_value = 11,
+        .center_freq = 2462,
     },
 };
 
@@ -459,6 +467,8 @@ static int __init vwifi_init(void)
     g_ctx = owl_create_context();
     if (!g_ctx)
         return 1;
+
+    eth_random_addr(fake_router_bssid);
 
     mutex_init(&g_ctx->lock);
 
