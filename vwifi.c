@@ -23,6 +23,8 @@ MODULE_DESCRIPTION("virtual cfg80211 driver");
 #define DEFAULT_SSID_LIST "[MyHomeWiFi]"
 #endif
 
+#define POOL_SIZE (8)
+
 struct owl_context {
     struct wiphy *wiphy;
     struct net_device *ndev;
@@ -39,9 +41,24 @@ struct owl_wiphy_priv_context {
     struct owl_context *owl;
 };
 
+/*
+ * A structure representing an in-flight packet.
+ */
+struct owl_packet {
+    struct owl_packet *next;
+    struct net_device *dev;
+    int	datalen;
+    u8 data[ETH_DATA_LEN];
+};
+
 struct owl_ndev_priv_context {
     struct owl_context *owl;
     struct wireless_dev wdev;
+    /* owl netdev device*/
+    struct owl_packet *ppool;
+    struct sk_buff *skb;
+    struct net_device *ndev;
+    struct net_device_stats stats;
 };
 
 static char *ssid_list = "";
@@ -354,12 +371,55 @@ static struct cfg80211_ops owl_cfg_ops = {
  * Callback called by the kernel when packet of data should be sent.
  * In this example it does nothing.
  */
-static netdev_tx_t owl_ndo_start_xmit(struct sk_buff *skb,
+static netdev_tx_t owl_tx(struct sk_buff *skb,
                                       struct net_device *dev)
 {
+    int len;
+    u8 *data, shortpkt[ETH_ZLEN];
+    struct owl_ndev_priv_context *priv = netdev_priv(dev);
+
+    data = skb->data;
+    len = skb->len;
+    if (len < ETH_ZLEN) {
+        memset(shortpkt, 0, ETH_ZLEN);
+        memcpy(shortpkt, skb->data, skb->len);
+        len = ETH_ZLEN;
+        data = shortpkt;
+    }
+    netif_trans_update(dev);
+    priv->stats.tx_packets++;
+    priv->stats.tx_bytes += skb->len;
+    /* Remember the skb, so we can free it at interrupt time */
+    priv->skb = skb;
     /* Don't forget to cleanup skb, as its ownership moved to xmit callback. */
     kfree_skb(skb);
     return NETDEV_TX_OK;
+}
+
+/*
+ * Open and close
+ */
+
+int owl_open(struct net_device *dev)
+{
+    memcpy(dev->dev_addr, "\0SNUL0", ETH_ALEN);
+    netif_start_queue(dev);
+    return 0;
+}
+
+int owl_release(struct net_device *dev)
+{
+    netif_stop_queue(dev); /* can't transmit any more */
+    return 0;
+}
+
+/*
+ * Return statistics to the caller
+ */
+struct net_device_stats *owl_stats(struct net_device *dev)
+{
+    struct owl_ndev_priv_context *priv = netdev_priv(dev);
+    return &priv->stats;
 }
 
 /* Structure of functions for network devices.
@@ -367,7 +427,10 @@ static netdev_tx_t owl_ndo_start_xmit(struct sk_buff *skb,
  * sent.
  */
 static struct net_device_ops owl_ndev_ops = {
-    .ndo_start_xmit = owl_ndo_start_xmit,
+    .ndo_open       = owl_open,
+    .ndo_stop       = owl_release,
+    .ndo_start_xmit = owl_tx,
+    .ndo_get_stats  = owl_stats,
 };
 
 /* Array of "supported" channels in 2GHz band. It is required for wiphy.
@@ -415,6 +478,27 @@ static struct ieee80211_supported_band nf_band_2ghz = {
     .bitrates = owl_supported_rates_2ghz,
     .n_bitrates = ARRAY_SIZE(owl_supported_rates_2ghz),
 };
+
+/*
+ * Set up a device's packet pool.
+ */
+void owl_setup_pool(struct net_device *dev)
+{
+    struct owl_ndev_priv_context *priv = netdev_priv(dev);
+    struct owl_packet *pkt;
+
+    priv->ppool = NULL;
+    for (int i = 0; i < POOL_SIZE; i++) {
+        pkt = kmalloc (sizeof (struct owl_packet), GFP_KERNEL);
+        if (pkt == NULL) {
+            printk (KERN_NOTICE "Ran out of memory allocating packet pool\n");
+            return;
+        }
+        pkt->dev = dev;
+        pkt->next = priv->ppool;
+        priv->ppool = pkt;
+    }
+}
 
 /* Creates wiphy context and net_device with wireless_dev.
  * wiphy/net_device/wireless_dev is basic interfaces for the kernel to interact
@@ -487,6 +571,7 @@ static struct owl_context *owl_create_context(void)
 
     /* fill private data of network context. */
     ndev_data = ndev_get_owl_context(ret->ndev);
+    memset(ndev_data, 0, sizeof(struct owl_ndev_priv_context));
     ndev_data->owl = ret;
 
     /* fill wireless_dev context.
@@ -505,6 +590,8 @@ static struct owl_context *owl_create_context(void)
     ret->ndev->netdev_ops = &owl_ndev_ops;
 
     /* Add here proper net_device initialization. */
+    ndev_data->ndev = ret->ndev;
+    owl_setup_pool(ret->ndev);
 
     /* register network device. If everything is ok, there should be new network
      * device: $ ip a
